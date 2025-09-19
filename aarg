@@ -1,0 +1,1147 @@
+#!/usr/bin/env python3
+"""
+aarg - Agentenanstaltsregelgenerator (Agent Institution Rule Generator)
+
+Generates firejail profiles ("Agentenanstaltsregeln") to securely sandbox AI coding
+assistants while preserving their functionality. Applies the principle of least
+privilege by creating structured institutional rules for AI agents. Supports Claude
+Code, Gemini CLI, and other MCP-compatible assistants.
+"""
+
+import argparse
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+# Configure logging with rich format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+
+class AssistantType(Enum):
+    """Supported AI assistant types."""
+    CLAUDE = "claude"
+    GEMINI = "gemini"
+    OPENCODE = "opencode"
+    WINDSURF = "windsurf"
+    CURSOR = "cursor"
+    AUTO = "auto"
+
+
+@dataclass
+class MCPServer:
+    """Represents an MCP server configuration."""
+    name: str
+    command: str
+    args: List[str] = field(default_factory=list)
+    env: Dict[str, str] = field(default_factory=dict)
+    server_type: str = "stdio"  # stdio, http, sse
+    
+    def get_binaries(self) -> Set[str]:
+        """Extract all binaries referenced in this MCP server."""
+        binaries = {self.command}
+        
+        # Check for common patterns in args
+        for arg in self.args:
+            # Check for uvx/npx package execution patterns
+            if self.command in ["uvx", "npx"] and not arg.startswith("-"):
+                # These are package names, not binaries
+                continue
+            # Check for direct binary references
+            if "/" in arg and Path(arg).exists():
+                binaries.add(arg)
+                
+        return binaries
+
+
+@dataclass
+class AssistantConfig:
+    """Configuration for an AI assistant."""
+    name: str
+    type: AssistantType
+    config_paths: List[Path]
+    mcp_servers: Dict[str, MCPServer] = field(default_factory=dict)
+    required_binaries: Set[str] = field(default_factory=set)
+    required_paths: Set[str] = field(default_factory=set)
+
+
+class AARG:
+    """Main application for generating firejail Agentenanstaltsregeln for AI assistants."""
+    
+    def __init__(self, assistant_type: AssistantType = AssistantType.AUTO, 
+                 verbose: bool = False):
+        """Initialize the Agentenanstaltsregeln generator.
+
+        Args:
+            assistant_type: Type of AI assistant to configure institutional rules for
+            verbose: Enable verbose logging
+        """
+        self.assistant_type = assistant_type
+        self.verbose = verbose
+        self.home_dir = Path.home()
+        self.current_dir = Path.cwd()
+        self.project_name = self.current_dir.name
+        
+        # Configure logging level
+        if verbose:
+            logger.setLevel(logging.DEBUG)
+            
+        # Collections for institutional rule generation
+        self.whitelisted_paths: Set[str] = set()
+        self.whitelisted_binaries: Set[str] = set()
+        self.detected_assistants: List[AssistantConfig] = []
+        
+        # AI assistant binaries to always include
+        self.ai_assistant_tools = [
+            'claude', 'gemini', 'opencode', 'windsurf', 'cursor',
+            'copilot', 'codeium', 'tabby', 'aider', 'continue'
+        ]
+
+        # Common development tools to always include
+        self.common_tools = [
+            # Package managers and runtimes
+            'node', 'npm', 'npx', 'yarn', 'pnpm', 'bun', 'deno',
+            'python', 'python3', 'pip', 'pip3', 'pipx',
+            'uv', 'uvx', 'poetry', 'pdm', 'hatch', 'rye',
+            'ruby', 'gem', 'bundler',
+            'cargo', 'rustc', 'go', 'java', 'javac', 'gradle', 'maven',
+
+            # Version control and network tools
+            'git', 'gh', 'gitlab', 'curl', 'wget', 'ssh', 'rsync',
+
+            # System tools
+            'bash', 'sh', 'zsh', 'fish', 'ps', 'ls', 'cat', 'grep',
+            'sed', 'awk', 'find', 'which', 'env', 'make', 'cmake',
+
+            # Container tools
+            'docker', 'podman', 'docker-compose', 'kubectl',
+
+            # Common MCP servers
+            'basic-memory', 'mcp', 'mcp-server',
+        ]
+        
+    def detect_all_assistants(self) -> List[AssistantType]:
+        """Detect all available AI assistants."""
+        logger.debug("🔍 Starting comprehensive AI assistant detection")
+
+        detected = []
+
+        # Check for assistant executables and configs
+        checks = [
+            (AssistantType.CLAUDE, "claude", [
+                self.home_dir / ".claude.json",
+                self.home_dir / ".claude" / "claude.json",
+                self.home_dir / ".config" / "claude" / "config.json"
+            ]),
+            (AssistantType.GEMINI, "gemini", [
+                self.home_dir / ".gemini" / "settings.json",
+                self.current_dir / ".gemini" / "settings.json",
+                self.home_dir / ".config" / "gemini" / "config.json"
+            ]),
+            (AssistantType.OPENCODE, "opencode", [
+                self.home_dir / ".opencode" / "config.json",
+                self.home_dir / ".config" / "opencode" / "settings.json"
+            ]),
+            (AssistantType.WINDSURF, "windsurf", [
+                self.home_dir / ".windsurf" / "config.json",
+                self.home_dir / ".config" / "windsurf" / "settings.json"
+            ]),
+            (AssistantType.CURSOR, "cursor", [
+                self.home_dir / ".cursor" / "config.json",
+                self.home_dir / ".config" / "cursor" / "settings.json"
+            ])
+        ]
+
+        for assistant_type, executable, config_paths in checks:
+            logger.debug(f"🔍 Checking for {assistant_type.value} ({executable})")
+
+            found = False
+
+            # Check if executable exists
+            if shutil.which(executable):
+                logger.debug(f"  ✅ Found executable: {executable}")
+                found = True
+
+            # Check if any config files exist
+            for config_path in config_paths:
+                if config_path.exists():
+                    logger.debug(f"  ✅ Found config: {config_path}")
+                    found = True
+                    break
+
+            if found:
+                detected.append(assistant_type)
+
+        if detected:
+            logger.info(f"✅ Detected assistants: {[a.value for a in detected]}")
+        else:
+            logger.warning("⚠️  No AI assistants detected")
+
+        return detected
+
+    def detect_assistant_type(self) -> AssistantType:
+        """Auto-detect primary AI assistant (for backward compatibility)."""
+        detected = self.detect_all_assistants()
+        return detected[0] if detected else AssistantType.AUTO
+
+    def choose_assistant_interactive(self, detected: List[AssistantType]) -> AssistantType:
+        """Allow user to choose from detected assistants."""
+        if len(detected) == 1:
+            return detected[0]
+
+        logger.info(f"\n🤖 Multiple AI assistants detected:")
+        for i, assistant in enumerate(detected, 1):
+            logger.info(f"  {i}. {assistant.value}")
+        logger.info(f"  {len(detected) + 1}. all (generate comprehensive profile)")
+
+        while True:
+            try:
+                choice = input(f"\nChoose assistant (1-{len(detected) + 1}): ").strip()
+                choice_num = int(choice)
+
+                if 1 <= choice_num <= len(detected):
+                    return detected[choice_num - 1]
+                elif choice_num == len(detected) + 1:
+                    return AssistantType.AUTO  # Will process all detected
+                else:
+                    logger.warning(f"Invalid choice. Please enter 1-{len(detected) + 1}")
+            except KeyboardInterrupt:
+                logger.info("\n\n🚪 Operation cancelled by user")
+                exit(0)
+            except (ValueError, EOFError):
+                logger.warning(f"Invalid input. Please enter a number 1-{len(detected) + 1}")
+                # For non-interactive environments, default to first detected
+                return detected[0]
+        
+    def find_ai_assistant_configs(self) -> List[AssistantConfig]:
+        """Find and parse all AI assistant configuration files."""
+        configs = []
+
+        # Handle assistant detection and selection
+        if self.assistant_type == AssistantType.AUTO:
+            detected = self.detect_all_assistants()
+            if not detected:
+                logger.warning("⚠️  No AI assistants detected, using generic configuration")
+                return configs
+
+            # For auto mode, offer interactive choice if multiple detected
+            if len(detected) > 1:
+                self.assistant_type = self.choose_assistant_interactive(detected)
+                if self.assistant_type == AssistantType.AUTO:
+                    # User chose "all" - process all detected assistants
+                    target_assistants = detected
+                else:
+                    target_assistants = [self.assistant_type]
+            else:
+                self.assistant_type = detected[0]
+                target_assistants = [self.assistant_type]
+                logger.info(f"✅ Auto-detected assistant: {self.assistant_type.value}")
+        else:
+            # Specific assistant requested
+            target_assistants = [self.assistant_type]
+
+        # Define configuration paths for each assistant
+        assistant_configs = {
+            AssistantType.CLAUDE: [
+                self.home_dir / ".claude.json",
+                self.home_dir / ".claude" / "claude.json",
+                self.home_dir / ".config" / "claude" / "config.json",
+            ],
+            AssistantType.GEMINI: [
+                self.home_dir / ".gemini" / "settings.json",
+                self.current_dir / ".gemini" / "settings.json",
+                self.home_dir / ".config" / "gemini" / "config.json",
+            ],
+            AssistantType.OPENCODE: [
+                self.home_dir / ".opencode" / "config.json",
+                self.home_dir / ".config" / "opencode" / "settings.json",
+            ],
+            AssistantType.WINDSURF: [
+                self.home_dir / ".windsurf" / "config.json",
+                self.home_dir / ".config" / "windsurf" / "settings.json",
+            ],
+            AssistantType.CURSOR: [
+                self.home_dir / ".cursor" / "config.json",
+                self.home_dir / ".config" / "cursor" / "settings.json",
+            ]
+        }
+
+        # Process configs for target assistants
+        for assistant_type in target_assistants:
+            paths = assistant_configs.get(assistant_type, [])
+            config = self._load_assistant_config(assistant_type, paths)
+            if config:
+                configs.append(config)
+
+        return configs
+        
+    def _load_assistant_config(self, assistant_type: AssistantType,
+                               paths: List[Path]) -> Optional[AssistantConfig]:
+        """Load configuration for a specific assistant type."""
+        config = AssistantConfig(
+            name=assistant_type.value,
+            type=assistant_type,
+            config_paths=[]
+        )
+
+        found_config = False
+        for path in paths:
+            if path.exists():
+                logger.debug(f"🔍 Found config file: {path}")
+                config.config_paths.append(path)
+
+                try:
+                    with open(path, 'r') as f:
+                        data = json.load(f)
+
+                    logger.debug(f"✅ Successfully parsed config: {len(data)} top-level keys")
+
+                    # Handle special Claude structure with project-specific sections
+                    if assistant_type == AssistantType.CLAUDE and "projects" in data:
+                        # Check global (user-level) MCP servers
+                        if "mcpServers" in data:
+                            logger.debug("🔍 Processing user-level Claude MCP servers")
+                            mcp_servers = self.extract_mcp_servers(data, assistant_type)
+                            config.mcp_servers.update(mcp_servers)
+
+                        # Check project-specific MCP servers
+                        projects = data.get("projects", {})
+                        current_project_key = str(self.current_dir)
+                        if current_project_key in projects:
+                            project_data = projects[current_project_key]
+                            logger.debug(f"🔍 Processing project-level Claude MCP servers for {current_project_key}")
+                            project_mcp_servers = self.extract_mcp_servers(project_data, assistant_type)
+                            config.mcp_servers.update(project_mcp_servers)
+
+                            # Project-level configs take precedence
+                            if project_mcp_servers and "mcpServers" in data:
+                                logger.debug("📝 Project-level MCP servers take precedence over user-level")
+                    else:
+                        # Standard config format for other assistants
+                        mcp_servers = self.extract_mcp_servers(data, assistant_type)
+                        config.mcp_servers.update(mcp_servers)
+
+                    # Extract other tool references
+                    self._extract_tool_references(data, config)
+
+                    found_config = True
+
+                except (json.JSONDecodeError, IOError) as e:
+                    logger.warning(f"⚠️  Error parsing {path}: {e}")
+
+        # Check for potential secrets in config files
+        if found_config:
+            self._check_config_secrets(config)
+
+        return config if found_config else None
+
+    def _check_config_secrets(self, config: AssistantConfig) -> None:
+        """Check configuration files for potential secrets and warn user."""
+        secret_patterns = [
+            'apiKey', 'api_key', 'token', 'secret', 'password', 'credentials',
+            'auth', 'bearer', 'oauth', 'key', 'private'
+        ]
+
+        for config_path in config.config_paths:
+            try:
+                with open(config_path, 'r') as f:
+                    content = f.read().lower()
+
+                found_secrets = [pattern for pattern in secret_patterns if pattern.lower() in content]
+                if found_secrets:
+                    logger.warning(f"🔒 SECURITY WARNING: {config_path} may contain secrets ({', '.join(found_secrets)})")
+                    logger.warning(f"    Consider using environment variables instead of storing secrets in config files")
+                    logger.warning(f"    The firejail profile will grant access to this file")
+
+            except IOError:
+                pass  # File already processed, ignore read errors
+        
+    def extract_mcp_servers(self, config_data: Dict[str, Any], 
+                           assistant_type: AssistantType) -> Dict[str, MCPServer]:
+        """Extract MCP server configurations from config data."""
+        mcp_servers = {}
+        
+        # Look for MCP servers in various locations
+        mcp_data = (
+            config_data.get('mcpServers', {}) or
+            config_data.get('mcp_servers', {}) or
+            config_data.get('servers', {}) or
+            config_data.get('tools', {})
+        )
+        
+        for server_name, server_config in mcp_data.items():
+            if isinstance(server_config, dict):
+                mcp_server = self._parse_mcp_server(server_name, server_config, assistant_type)
+                if mcp_server:
+                    mcp_servers[server_name] = mcp_server
+                    logger.debug(f"✅ Added MCP server: {server_name} -> {mcp_server.command}")
+                    
+        return mcp_servers
+        
+    def _parse_mcp_server(self, name: str, config: Dict[str, Any], 
+                         assistant_type: AssistantType) -> Optional[MCPServer]:
+        """Parse a single MCP server configuration."""
+        # Claude format: {"type": "stdio", "command": "...", "args": [...]}
+        # Gemini format: {"command": "...", "args": [...]}
+        # Generic format: {"executable": "...", "arguments": [...]}
+        
+        command = (
+            config.get('command') or 
+            config.get('executable') or
+            config.get('binary') or
+            config.get('cmd')
+        )
+        
+        if not command:
+            return None
+            
+        args = (
+            config.get('args', []) or
+            config.get('arguments', []) or
+            config.get('params', [])
+        )
+        
+        # Ensure args is a list
+        if isinstance(args, str):
+            args = args.split()
+        elif not isinstance(args, list):
+            args = []
+            
+        env = config.get('env', {}) or config.get('environment', {})
+        server_type = config.get('type', 'stdio')
+        
+        return MCPServer(
+            name=name,
+            command=command,
+            args=args,
+            env=env,
+            server_type=server_type
+        )
+        
+    def _extract_tool_references(self, data: Dict[str, Any], 
+                                 config: AssistantConfig) -> None:
+        """Extract additional tool references from configuration."""
+        # Look for tool definitions in various formats
+        tools_sections = [
+            data.get('tools', {}),
+            data.get('extensions', {}),
+            data.get('plugins', {}),
+            data.get('commands', {}),
+        ]
+        
+        for section in tools_sections:
+            if not isinstance(section, dict):
+                continue
+                
+            for tool_name, tool_config in section.items():
+                if isinstance(tool_config, dict):
+                    # Extract command/binary references
+                    for key in ['command', 'executable', 'binary', 'path']:
+                        if key in tool_config:
+                            binary = tool_config[key]
+                            if isinstance(binary, str):
+                                config.required_binaries.add(binary)
+                                logger.debug(f"  Found tool reference: {binary}")
+                                
+                    # Extract path references
+                    for key in ['workingDirectory', 'cwd', 'path', 'directory']:
+                        if key in tool_config:
+                            path = tool_config[key]
+                            if isinstance(path, str):
+                                config.required_paths.add(path)
+                                
+    def detect_cross_assistant_dependencies(self, configs: List[AssistantConfig]) -> Dict[str, Set[str]]:
+        """Detect when MCP servers reference other AI assistants."""
+        dependencies = {}
+
+        for config in configs:
+            config_deps = set()
+
+            for server_name, mcp_server in config.mcp_servers.items():
+                # Check if MCP command references another AI assistant
+                for ai_tool in self.ai_assistant_tools:
+                    if (mcp_server.command == ai_tool or
+                        ai_tool in str(mcp_server.args) or
+                        f"{ai_tool}-cli" in server_name.lower()):
+                        config_deps.add(ai_tool)
+                        logger.debug(f"🔗 {config.name} MCP '{server_name}' depends on '{ai_tool}'")
+
+            if config_deps:
+                dependencies[config.name] = config_deps
+
+        return dependencies
+
+    def resolve_dependency_configs(self, dependencies: Dict[str, Set[str]]) -> List[AssistantConfig]:
+        """Load configurations for detected dependencies."""
+        dependency_configs = []
+
+        for primary_assistant, deps in dependencies.items():
+            for dep_assistant in deps:
+                # Convert string to AssistantType
+                try:
+                    dep_type = AssistantType(dep_assistant)
+                except ValueError:
+                    logger.debug(f"⚠️  Unknown assistant type: {dep_assistant}")
+                    continue
+
+                # Check if we already have this config loaded
+                already_loaded = any(c.type == dep_type for c in dependency_configs)
+                if already_loaded:
+                    continue
+
+                # Load dependency config
+                assistant_configs = {
+                    AssistantType.CLAUDE: [
+                        self.home_dir / ".claude.json",
+                        self.home_dir / ".claude" / "claude.json",
+                        self.home_dir / ".config" / "claude" / "config.json",
+                    ],
+                    AssistantType.GEMINI: [
+                        self.home_dir / ".gemini" / "settings.json",
+                        self.current_dir / ".gemini" / "settings.json",
+                        self.home_dir / ".config" / "gemini" / "config.json",
+                    ],
+                    AssistantType.OPENCODE: [
+                        self.home_dir / ".opencode" / "config.json",
+                        self.home_dir / ".config" / "opencode" / "settings.json",
+                    ],
+                    AssistantType.WINDSURF: [
+                        self.home_dir / ".windsurf" / "config.json",
+                        self.home_dir / ".config" / "windsurf" / "settings.json",
+                    ],
+                    AssistantType.CURSOR: [
+                        self.home_dir / ".cursor" / "config.json",
+                        self.home_dir / ".config" / "cursor" / "settings.json",
+                    ]
+                }
+
+                paths = assistant_configs.get(dep_type, [])
+                dep_config = self._load_assistant_config(dep_type, paths)
+                if dep_config:
+                    logger.info(f"🔗 Loaded dependency config for {dep_assistant} (used by {primary_assistant})")
+                    dependency_configs.append(dep_config)
+
+        return dependency_configs
+
+    def collect_binaries(self, configs: List[AssistantConfig]) -> None:
+        """Collect all required binaries and their paths."""
+        all_binaries = set(self.common_tools)
+
+        # Always include AI assistant binaries (for cross-assistant MCP dependencies)
+        all_binaries.update(self.ai_assistant_tools)
+
+        # Detect and resolve cross-assistant dependencies
+        dependencies = self.detect_cross_assistant_dependencies(configs)
+        if dependencies:
+            logger.info(f"\n🔗 Detected cross-assistant dependencies: {dependencies}")
+
+            # Ask user for confirmation (following Gemini's suggestion)
+            for primary, deps in dependencies.items():
+                deps_str = ", ".join(deps)
+                try:
+                    response = input(f"\n❓ {primary} uses {deps_str}. Include dependencies? [Y/n]: ").strip().lower()
+                    if response in ['', 'y', 'yes']:
+                        dependency_configs = self.resolve_dependency_configs({primary: deps})
+                        configs.extend(dependency_configs)
+                        logger.info(f"✅ Added {deps_str} dependencies")
+                    else:
+                        logger.info(f"⏭️  Skipped {deps_str} dependencies")
+                except KeyboardInterrupt:
+                    logger.info("\n\n🚪 Operation cancelled by user")
+                    exit(0)
+                except EOFError:
+                    # Non-interactive environment, default to yes
+                    dependency_configs = self.resolve_dependency_configs({primary: deps})
+                    configs.extend(dependency_configs)
+                    logger.info(f"✅ Auto-added {deps_str} dependencies (non-interactive mode)")
+
+        # Add binaries from MCP servers
+        for config in configs:
+            for mcp_server in config.mcp_servers.values():
+                all_binaries.update(mcp_server.get_binaries())
+            all_binaries.update(config.required_binaries)
+            
+        logger.info("\n🔍 Searching for institutional tools (binaries)...")
+        
+        for binary in sorted(all_binaries):
+            binary_path = self._find_binary_path(binary)
+            if binary_path:
+                self.whitelisted_binaries.add(binary_path)
+                logger.debug(f"  ✅ {binary}: {binary_path}")
+            else:
+                logger.debug(f"  ⚠️  {binary}: not found in PATH")
+                
+    def _find_binary_path(self, binary_name: str) -> Optional[str]:
+        """Find the full path of a binary."""
+        # First try which
+        path = shutil.which(binary_name)
+        if path:
+            return path
+            
+        # Check common locations
+        common_paths = [
+            Path("/usr/local/bin") / binary_name,
+            Path("/usr/bin") / binary_name,
+            Path("/bin") / binary_name,
+            self.home_dir / ".local" / "bin" / binary_name,
+            self.home_dir / ".cargo" / "bin" / binary_name,
+            self.home_dir / ".npm" / "bin" / binary_name,
+            self.home_dir / ".yarn" / "bin" / binary_name,
+        ]
+        
+        for path in common_paths:
+            if path.exists() and path.is_file():
+                return str(path)
+                
+        return None
+        
+    def add_essential_paths(self, configs: List[AssistantConfig]) -> None:
+        """Add essential directories for development tools."""
+        essential_paths = [
+            # User directories
+            str(self.home_dir / '.local'),
+            str(self.home_dir / '.npm'),
+            str(self.home_dir / '.yarn'),
+            str(self.home_dir / '.pnpm'),
+            str(self.home_dir / '.cache'),
+            str(self.home_dir / '.config'),
+
+            # Python environments
+            str(self.home_dir / '.pyenv'),
+            str(self.home_dir / '.virtualenvs'),
+            str(self.home_dir / '.conda'),
+
+            # Language-specific
+            str(self.home_dir / '.cargo'),
+            str(self.home_dir / '.rustup'),
+            str(self.home_dir / '.gem'),
+            str(self.home_dir / '.go'),
+
+            # System directories
+            '/tmp',
+            '/var/tmp',
+            '/lib',
+            '/lib64',
+            '/usr/lib',
+            '/usr/lib64',
+            '/usr/share',
+            '/usr/local/lib',
+            '/usr/local/share',
+
+            # Development tools
+            '/etc/ssl/certs',  # For HTTPS connections
+            '/etc/alternatives',  # For alternative commands
+        ]
+
+        # Add assistant-specific directories for ALL configs (including dependencies)
+        assistant_paths_map = {
+            AssistantType.CLAUDE: [
+                str(self.home_dir / '.claude'),
+                str(self.home_dir / '.config' / 'claude'),
+            ],
+            AssistantType.GEMINI: [
+                str(self.home_dir / '.gemini'),
+                str(self.home_dir / '.config' / 'gemini'),
+            ],
+            AssistantType.OPENCODE: [
+                str(self.home_dir / '.opencode'),
+                str(self.home_dir / '.config' / 'opencode'),
+            ],
+            AssistantType.WINDSURF: [
+                str(self.home_dir / '.windsurf'),
+                str(self.home_dir / '.config' / 'windsurf'),
+            ],
+            AssistantType.CURSOR: [
+                str(self.home_dir / '.cursor'),
+                str(self.home_dir / '.config' / 'cursor'),
+            ]
+        }
+
+        for config in configs:
+            paths_for_assistant = assistant_paths_map.get(config.type, [])
+            essential_paths.extend(paths_for_assistant)
+
+            # Add paths from config
+            for path in config.required_paths:
+                if path.startswith('~'):
+                    path = str(self.home_dir / path[2:])
+                essential_paths.append(path)
+                
+        logger.info("\n🏢 Adding permitted areas (directories) to institutional rules...")
+        
+        for path in essential_paths:
+            if os.path.exists(path):
+                self.whitelisted_paths.add(path)
+                logger.debug(f"  ✅ {path}")
+            else:
+                logger.debug(f"  ⚠️  {path}: doesn't exist (skipping)")
+                
+    def generate_profile(self, enable_logging: bool = False, configs: List[AssistantConfig] = None) -> str:
+        """Generate the firejail Agentenanstaltsregeln profile."""
+        configs = configs or []
+
+        # Generate profile name based on assistants included
+        assistant_names = [config.name for config in configs] if configs else [self.assistant_type.value]
+        if len(assistant_names) > 1:
+            primary = assistant_names[0]
+            dependencies = assistant_names[1:]
+            profile_title = f"{primary.title()} with {', '.join(dep.title() for dep in dependencies)}"
+        else:
+            profile_title = assistant_names[0].title()
+
+        profile_lines = [
+            f"# aarg - Agentenanstaltsregeln for {profile_title}",
+            f"# Project: {self.project_name}",
+            f"# Generated institutional rules with permitted areas (directories) and tools (binaries)",
+            "",
+            "include globals.local",
+            "",
+            "# Private institutional area - restricted to project directory",
+            f"private {self.current_dir}",
+            "",
+        ]
+        
+        if enable_logging:
+            profile_lines.extend([
+                "# Logging and monitoring - track which areas are actually visited",
+                "tracelog",
+                "",
+            ])
+            
+        profile_lines.extend([
+            "# Permitted areas (whitelisted directories)",
+        ])
+        
+        # Add whitelisted paths
+        for path in sorted(self.whitelisted_paths):
+            profile_lines.append(f"whitelist {path}")
+            
+        profile_lines.extend([
+            "",
+            "# Permitted tools (whitelisted binaries)",
+        ])
+        
+        # Add whitelisted binaries
+        for binary in sorted(self.whitelisted_binaries):
+            profile_lines.append(f"whitelist {binary}")
+            
+        # Special handling for Docker/Podman
+        if any('docker' in b or 'podman' in b for b in self.whitelisted_binaries):
+            profile_lines.extend([
+                "",
+                "# Container tool access (Docker/Podman)",
+                "ignore noroot",  # Docker needs root in container
+                "whitelist /var/run/docker.sock",
+                "whitelist /run/user/${UID}/podman",
+            ])
+            
+        profile_lines.extend([
+            "",
+            "# Network access (required for MCP servers and package managers)",
+            "netfilter",
+            "protocol unix,inet,inet6",
+            "",
+            "# Security restrictions - institutional rules",
+            "noroot",
+            "novideo",
+            "nogroups",
+            "nonewprivs",
+            "",
+            "# Disable unnecessary features - remove unused institutional amenities",
+            "nodvd",
+            "notv",
+            "nou2f",
+            "",
+            "# Additional hardening",
+            "caps.drop all",
+            "seccomp",
+            "private-dev",
+            "noexec /tmp",  # Prevent execution from tmp
+        ])
+        
+        return "\n".join(profile_lines)
+        
+    def suggest_profile_path(self, configs: List[AssistantConfig] = None) -> Path:
+        """Suggest a profile file path based on project and assistant(s)."""
+        firejail_dir = self.home_dir / '.config' / 'firejail'
+        firejail_dir.mkdir(parents=True, exist_ok=True)
+
+        configs = configs or []
+
+        # Generate filename based on assistants included
+        if configs:
+            assistant_names = [config.name for config in configs]
+            if len(assistant_names) > 1:
+                primary = assistant_names[0]
+                dependencies = assistant_names[1:]
+                profile_name = f"{primary}-with-{'-'.join(dependencies)}-{self.project_name}.agentenanstaltsregeln"
+            else:
+                profile_name = f"{assistant_names[0]}-{self.project_name}.agentenanstaltsregeln"
+        else:
+            assistant_name = self.assistant_type.value
+            if assistant_name == "auto":
+                assistant_name = "ai-assistant"
+            profile_name = f"{assistant_name}-{self.project_name}.agentenanstaltsregeln"
+
+        return firejail_dir / profile_name
+        
+    def analyze_firejail_logs(self, log_file: Optional[Path] = None) -> Dict[str, Any]:
+        """Analyze firejail trace logs to understand actual usage patterns."""
+        if not log_file:
+            # Look for most recent firejail log
+            log_files = list(Path("/tmp").glob("firejail-*.log"))
+            if not log_files:
+                logger.error("❌ No firejail log files found in /tmp")
+                return {}
+                
+            log_file = max(log_files, key=lambda p: p.stat().st_mtime)
+            logger.info(f"📊 Analyzing most recent log: {log_file}")
+            
+        accessed_paths = set()
+        access_patterns = {}
+        
+        try:
+            with open(log_file, 'r') as f:
+                for line in f:
+                    # Parse firejail trace log format
+                    if 'open(' in line or 'access(' in line:
+                        # Extract path from syscall
+                        match = re.search(r'"([^"]+)"', line)
+                        if match:
+                            path = match.group(1)
+                            accessed_paths.add(path)
+                            
+                            # Track access patterns
+                            path_type = self._categorize_path(path)
+                            access_patterns[path_type] = access_patterns.get(path_type, 0) + 1
+                            
+        except IOError as e:
+            logger.error(f"❌ Error reading log file: {e}")
+            return {}
+            
+        # Save accessed paths for optimization
+        accessed_file = self.current_dir / "accessed_paths.txt"
+        with open(accessed_file, 'w') as f:
+            for path in sorted(accessed_paths):
+                f.write(f"{path}\n")
+                
+        logger.info(f"📊 Analysis complete:")
+        logger.info(f"   Total rooms visited: {len(accessed_paths)}")
+        logger.info(f"   Most frequently visited room types:")
+        for path_type, count in sorted(access_patterns.items(), 
+                                      key=lambda x: x[1], reverse=True)[:5]:
+            logger.info(f"     - {path_type}: {count} visits")
+        logger.info(f"   Complete access log saved to: {accessed_file}")
+        
+        return {
+            'accessed_paths': accessed_paths,
+            'access_patterns': access_patterns,
+            'log_file': str(log_file)
+        }
+        
+    def _categorize_path(self, path: str) -> str:
+        """Categorize a path for analysis."""
+        if path.startswith('/tmp'):
+            return 'temporary'
+        elif path.startswith('/usr/lib') or path.startswith('/lib'):
+            return 'library'
+        elif path.startswith('/usr/bin') or path.startswith('/bin'):
+            return 'binary'
+        elif path.startswith(str(self.home_dir)):
+            if '/.cache' in path:
+                return 'cache'
+            elif '/.config' in path:
+                return 'config'
+            elif '/.local' in path:
+                return 'local'
+            else:
+                return 'home'
+        elif path.startswith('/etc'):
+            return 'system_config'
+        else:
+            return 'other'
+            
+    def generate_optimized_profile(self, accessed_paths: Set[str]) -> str:
+        """Generate an optimized profile based on actual usage."""
+        # Determine which whitelisted items were actually used
+        used_paths = set()
+        used_binaries = set()
+        unused_paths = set()
+        unused_binaries = set()
+        
+        for path in self.whitelisted_paths:
+            if any(accessed.startswith(path) for accessed in accessed_paths):
+                used_paths.add(path)
+            else:
+                unused_paths.add(path)
+                
+        for binary in self.whitelisted_binaries:
+            if binary in accessed_paths:
+                used_binaries.add(binary)
+            else:
+                unused_binaries.add(binary)
+                
+        # Find accessed paths not in whitelist
+        missing_paths = set()
+        for accessed in accessed_paths:
+            if not any(accessed.startswith(w) for w in self.whitelisted_paths):
+                # Only suggest parent directories, not individual files
+                parent = Path(accessed).parent
+                if parent.exists() and parent.is_dir():
+                    missing_paths.add(str(parent))
+                    
+        logger.info("\n📈 JAIL PLAN OPTIMIZATION ANALYSIS:")
+        logger.info(f"   Rooms in jail plan: {len(self.whitelisted_paths)}")
+        logger.info(f"   ✅ Used rooms: {len(used_paths)}")
+        logger.info(f"   ❌ Unused rooms: {len(unused_paths)}")
+        logger.info(f"   ⚠️  Missing rooms: {len(missing_paths)}")
+        
+        if unused_paths:
+            logger.info("\n🗑️  UNUSED ROOMS (can be removed):")
+            for path in sorted(unused_paths)[:10]:
+                logger.info(f"   {path}")
+                
+        if missing_paths:
+            logger.info("\n➕ SUGGESTED ROOM ADDITIONS:")
+            for path in sorted(missing_paths)[:10]:
+                logger.info(f"   whitelist {path}")
+                
+        # Generate optimized profile
+        profile_lines = []
+        for line in self.generate_profile(enable_logging=True).split('\n'):
+            if line.startswith('whitelist '):
+                path = line.replace('whitelist ', '')
+                if path in unused_paths or path in unused_binaries:
+                    profile_lines.append(f"# UNUSED ROOM: {line}")
+                else:
+                    profile_lines.append(line)
+            else:
+                profile_lines.append(line)
+                
+        # Add suggested additions
+        if missing_paths:
+            profile_lines.append("")
+            profile_lines.append("# SUGGESTED ROOM ADDITIONS:")
+            for path in sorted(missing_paths)[:10]:
+                profile_lines.append(f"# whitelist {path}")
+                
+        return "\n".join(profile_lines)
+        
+    def run_generate_mode(self) -> None:
+        """Main execution mode for generating Agentenanstaltsregeln."""
+        logger.info("🎯 aarg - Agentenanstaltsregelgenerator")
+        logger.info(f"🏗️  Project area: {self.project_name}")
+        logger.info(f"🏛️  Institution location: {self.home_dir}")
+        logger.info("")
+        
+        # Find and parse configurations
+        configs = self.find_ai_assistant_configs()
+        if not configs:
+            logger.warning("⚠️  No AI assistant configurations found")
+            logger.info("📝 Generating generic institutional rules with common tools only")
+            configs = []  # Continue with empty configs
+            
+        # Show detected configurations
+        for config in configs:
+            logger.info(f"📋 Found {config.name} configuration:")
+            logger.info(f"   Config files: {len(config.config_paths)}")
+            logger.info(f"   MCP servers: {len(config.mcp_servers)}")
+            if self.verbose and config.mcp_servers:
+                for server_name, server in config.mcp_servers.items():
+                    logger.info(f"     - {server_name}: {server.command}")
+                    
+        # Collect binaries and paths
+        self.collect_binaries(configs)
+        self.add_essential_paths(configs)
+        
+        # Ask about logging
+        try:
+            logging_response = input("\n❓ Enable access tracking (logging)? [y/N]: ").strip().lower()
+            enable_logging = logging_response in ['y', 'yes']
+        except KeyboardInterrupt:
+            logger.info("\n\n🚪 Operation cancelled by user")
+            exit(0)
+        
+        # Generate profile
+        profile_content = self.generate_profile(enable_logging, configs)
+        
+        # Display generated profile
+        logger.info("\n" + "="*60)
+        logger.info("📄 GENERATED INSTITUTIONAL RULES:")
+        logger.info("="*60)
+        print(profile_content)
+        logger.info("="*60)
+        
+        # Suggest save location
+        suggested_path = self.suggest_profile_path(configs)
+        logger.info(f"\n💾 Suggested institutional rules location:")
+        logger.info(f"   {suggested_path}")
+
+        # Ask to save
+        try:
+            response = input(f"\n❓ Save institutional rules to {suggested_path}? [y/N]: ").strip().lower()
+        except KeyboardInterrupt:
+            logger.info("\n\n🚪 Operation cancelled by user")
+            exit(0)
+
+        if response in ['y', 'yes']:
+            try:
+                with open(suggested_path, 'w') as f:
+                    f.write(profile_content)
+                logger.info(f"✅ Institutional rules saved to {suggested_path}")
+
+                # Show usage instructions
+                profile_name = suggested_path.stem
+                assistant_cmd = configs[0].name if configs else self.assistant_type.value
+                if assistant_cmd == "auto":
+                    assistant_cmd = "claude code"  # Default example
+                    
+                logger.info(f"\n🎯 Lock up your app with:")
+                if enable_logging:
+                    logger.info(f"   # First run with tracking to capture usage:")
+                    logger.info(f"   firejail --tracelog --profile={profile_name} {assistant_cmd}")
+                    logger.info(f"   # Then optimize the floor plan:")
+                    logger.info(f"   {sys.argv[0]} --optimize --assistant {self.assistant_type.value}")
+                else:
+                    logger.info(f"   firejail --profile={profile_name} {assistant_cmd}")
+
+            except IOError as e:
+                logger.error(f"❌ Error saving institutional rules: {e}")
+        else:
+            logger.info("📋 Institutional rules not saved. Copy the content above to use manually.")
+
+        logger.info(f"\n🔒 These institutional rules restrict {self.assistant_type.value} to:")
+        logger.info(f"   • Project area: {self.current_dir}")
+        logger.info(f"   • {len(self.whitelisted_paths)} permitted areas")
+        logger.info(f"   • {len(self.whitelisted_binaries)} permitted tools")
+        
+    def run_analysis_mode(self) -> None:
+        """Run analysis mode to examine firejail logs."""
+        logger.info("📊 FIREJAIL LOG ANALYSIS MODE")
+        logger.info("")
+        
+        analysis = self.analyze_firejail_logs()
+        if not analysis:
+            logger.error("❌ Analysis failed - no logs found")
+            return
+            
+        # Additional analysis could be added here
+        logger.info("\n💡 Next step: Run optimization mode to clean up your jail plan")
+        logger.info(f"   {sys.argv[0]} --optimize --assistant {self.assistant_type.value}")
+        
+    def run_optimization_mode(self) -> None:
+        """Run optimization mode to refine existing profiles."""
+        logger.info("🔧 JAIL PLAN OPTIMIZATION MODE")
+        logger.info("")
+        
+        # First analyze logs
+        analysis = self.analyze_firejail_logs()
+        if not analysis:
+            logger.error("❌ Cannot optimize without usage data")
+            logger.info("💡 First run your AI assistant with logging enabled:")
+            logger.info("   firejail --tracelog --profile=your-profile assistant-command")
+            return
+            
+        # Regenerate profile configuration
+        configs = self.find_ai_assistant_configs()
+        self.collect_binaries(configs)
+        self.add_essential_paths(configs)
+        
+        # Generate optimized profile
+        optimized_profile = self.generate_optimized_profile(
+            analysis['accessed_paths']
+        )
+        
+        # Save optimized profile
+        original_path = self.suggest_profile_path()
+        optimized_path = original_path.with_suffix('.optimized.agentenanstaltsregeln')
+        
+        try:
+            response = input(f"\n❓ Save optimized institutional rules to {optimized_path}? [y/N]: ").strip().lower()
+        except KeyboardInterrupt:
+            logger.info("\n\n🚪 Operation cancelled by user")
+            exit(0)
+
+        if response in ['y', 'yes']:
+            try:
+                with open(optimized_path, 'w') as f:
+                    f.write(optimized_profile)
+                logger.info(f"✅ Optimized institutional rules saved to {optimized_path}")
+                logger.info("\n💡 Test the optimized plan:")
+                logger.info(f"   firejail --profile={optimized_path.stem} {self.assistant_type.value}")
+                logger.info("\nIf it works well, replace the original:")
+                logger.info(f"   mv {optimized_path} {original_path}")
+            except IOError as e:
+                logger.error(f"❌ Error saving optimized profile: {e}")
+
+
+def main():
+    """Main entry point for the application."""
+    parser = argparse.ArgumentParser(
+        description="aarg - Agentenanstaltsregelgenerator for AI Coding Assistants",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                    # Auto-detect assistant and generate institutional rules
+  %(prog)s --assistant claude # Generate institutional rules for Claude Code
+  %(prog)s --analyze          # Analyze firejail logs to see usage patterns
+  %(prog)s --optimize         # Optimize existing institutional rules based on usage
+  %(prog)s --verbose          # Show detailed debugging information
+        """
+    )
+    
+    parser.add_argument(
+        "--assistant",
+        type=str,
+        choices=[t.value for t in AssistantType],
+        default="auto",
+        help="AI assistant type (default: auto-detect)"
+    )
+    
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="Analyze firejail logs to understand usage patterns"
+    )
+    
+    parser.add_argument(
+        "--optimize",
+        action="store_true",
+        help="Optimize existing institutional rules based on usage logs"
+    )
+    
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose debug output"
+    )
+    
+    args = parser.parse_args()
+    
+    # Create application instance
+    assistant_type = AssistantType(args.assistant)
+    app = AARG(assistant_type=assistant_type, verbose=args.verbose)
+    
+    # Run appropriate mode
+    if args.analyze:
+        app.run_analysis_mode()
+    elif args.optimize:
+        app.run_optimization_mode()
+    else:
+        app.run_generate_mode()
+
+
+if __name__ == "__main__":
+    main()
