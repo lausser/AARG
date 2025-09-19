@@ -51,7 +51,11 @@ class MCPServer:
     
     def get_binaries(self) -> Set[str]:
         """Extract all binaries referenced in this MCP server."""
-        binaries = {self.command}
+        # Handle both string and list commands
+        if isinstance(self.command, list):
+            binaries = {self.command[0]} if self.command else set()
+        else:
+            binaries = {self.command}
         
         # Check for common patterns in args
         for arg in self.args:
@@ -141,26 +145,51 @@ class AARG:
         # Check for assistant executables and configs
         checks = [
             (AssistantType.CLAUDE, "claude", [
+                # User configs
                 self.home_dir / ".claude.json",
                 self.home_dir / ".claude" / "claude.json",
-                self.home_dir / ".config" / "claude" / "config.json"
+                self.home_dir / ".config" / "claude" / "config.json",
+                # Project configs
+                self.current_dir / ".claude" / "settings.json",
+                self.current_dir / ".claude" / "settings.local.json",
+                # Enterprise/System configs
+                Path("/etc/claude-code/managed-settings.json"),
+                Path("/Library/Application Support/ClaudeCode/managed-settings.json")
             ]),
             (AssistantType.GEMINI, "gemini", [
+                # User configs
                 self.home_dir / ".gemini" / "settings.json",
+                self.home_dir / ".config" / "gemini" / "config.json",
+                # Project configs
                 self.current_dir / ".gemini" / "settings.json",
-                self.home_dir / ".config" / "gemini" / "config.json"
+                self.current_dir / ".gemini" / "config.json"
             ]),
             (AssistantType.OPENCODE, "opencode", [
-                self.home_dir / ".opencode" / "config.json",
-                self.home_dir / ".config" / "opencode" / "settings.json"
+                # Custom config via environment variable
+                Path(os.environ.get("OPENCODE_CONFIG", "")),
+                # Project configs (highest precedence)
+                self.current_dir / "opencode.json",
+                # User configs
+                self.home_dir / ".config" / "opencode" / "opencode.json",
+                self.home_dir / ".opencode.json"
             ]),
             (AssistantType.WINDSURF, "windsurf", [
+                # User configs
                 self.home_dir / ".windsurf" / "config.json",
-                self.home_dir / ".config" / "windsurf" / "settings.json"
+                self.home_dir / ".config" / "windsurf" / "settings.json",
+                self.home_dir / ".codeium" / ".codeiumignore",
+                # Project configs
+                self.current_dir / ".windsurfrules",
+                self.current_dir / ".windsurf" / "rules"
             ]),
             (AssistantType.CURSOR, "cursor", [
+                # User configs
                 self.home_dir / ".cursor" / "config.json",
-                self.home_dir / ".config" / "cursor" / "settings.json"
+                self.home_dir / ".cursor" / "cli-config.json",
+                self.home_dir / ".cursor-server",
+                self.home_dir / ".config" / "cursor" / "settings.json",
+                # Project configs
+                self.current_dir / ".cursor" / "index.mdc"
             ])
         ]
 
@@ -176,7 +205,8 @@ class AARG:
 
             # Check if any config files exist
             for config_path in config_paths:
-                if config_path.exists():
+                # Skip empty paths (e.g., from empty environment variables)
+                if str(config_path) and config_path.exists():
                     logger.debug(f"  ✅ Found config: {config_path}")
                     found = True
                     break
@@ -255,26 +285,51 @@ class AARG:
         # Define configuration paths for each assistant
         assistant_configs = {
             AssistantType.CLAUDE: [
+                # User configs
                 self.home_dir / ".claude.json",
                 self.home_dir / ".claude" / "claude.json",
                 self.home_dir / ".config" / "claude" / "config.json",
+                # Project configs
+                self.current_dir / ".claude" / "settings.json",
+                self.current_dir / ".claude" / "settings.local.json",
+                # Enterprise/System configs
+                Path("/etc/claude-code/managed-settings.json"),
+                Path("/Library/Application Support/ClaudeCode/managed-settings.json")
             ],
             AssistantType.GEMINI: [
+                # User configs
                 self.home_dir / ".gemini" / "settings.json",
-                self.current_dir / ".gemini" / "settings.json",
                 self.home_dir / ".config" / "gemini" / "config.json",
+                # Project configs
+                self.current_dir / ".gemini" / "settings.json",
+                self.current_dir / ".gemini" / "config.json"
             ],
             AssistantType.OPENCODE: [
-                self.home_dir / ".opencode" / "config.json",
-                self.home_dir / ".config" / "opencode" / "settings.json",
+                # Custom config via environment variable
+                Path(os.environ.get("OPENCODE_CONFIG", "")),
+                # Project configs (highest precedence)
+                self.current_dir / "opencode.json",
+                # User configs
+                self.home_dir / ".config" / "opencode" / "opencode.json",
+                self.home_dir / ".opencode.json"
             ],
             AssistantType.WINDSURF: [
+                # User configs
                 self.home_dir / ".windsurf" / "config.json",
                 self.home_dir / ".config" / "windsurf" / "settings.json",
+                self.home_dir / ".codeium" / ".codeiumignore",
+                # Project configs
+                self.current_dir / ".windsurfrules",
+                self.current_dir / ".windsurf" / "rules"
             ],
             AssistantType.CURSOR: [
+                # User configs
                 self.home_dir / ".cursor" / "config.json",
+                self.home_dir / ".cursor" / "cli-config.json",
+                self.home_dir / ".cursor-server",
                 self.home_dir / ".config" / "cursor" / "settings.json",
+                # Project configs
+                self.current_dir / ".cursor" / "index.mdc"
             ]
         }
 
@@ -298,7 +353,8 @@ class AARG:
 
         found_config = False
         for path in paths:
-            if path.exists():
+            # Skip empty paths (e.g., from empty environment variables)
+            if str(path) and path.exists():
                 logger.debug(f"🔍 Found config file: {path}")
                 config.config_paths.append(path)
 
@@ -374,12 +430,17 @@ class AARG:
         mcp_servers = {}
         
         # Look for MCP servers in various locations
-        mcp_data = (
-            config_data.get('mcpServers', {}) or
-            config_data.get('mcp_servers', {}) or
-            config_data.get('servers', {}) or
-            config_data.get('tools', {})
-        )
+        if assistant_type == AssistantType.OPENCODE:
+            # OpenCode uses "mcp" key with different structure
+            mcp_data = config_data.get('mcp', {})
+        else:
+            # Claude, Gemini, and others use "mcpServers"
+            mcp_data = (
+                config_data.get('mcpServers', {}) or
+                config_data.get('mcp_servers', {}) or
+                config_data.get('servers', {}) or
+                config_data.get('tools', {})
+            )
         
         for server_name, server_config in mcp_data.items():
             if isinstance(server_config, dict):
@@ -398,34 +459,49 @@ class AARG:
         # Generic format: {"executable": "...", "arguments": [...]}
         
         command = (
-            config.get('command') or 
+            config.get('command') or
             config.get('executable') or
             config.get('binary') or
             config.get('cmd')
         )
-        
+
         if not command:
             return None
-            
+
+        # Handle command as either string or list
+        if isinstance(command, list):
+            # If command is a list, first element is the command, rest are args
+            if not command:
+                return None
+            actual_command = command[0]
+            command_args = command[1:] if len(command) > 1 else []
+        else:
+            # Command is a string
+            actual_command = command
+            command_args = []
+
         args = (
             config.get('args', []) or
             config.get('arguments', []) or
             config.get('params', [])
         )
-        
-        # Ensure args is a list
+
+        # Ensure args is a list and combine with command args
         if isinstance(args, str):
             args = args.split()
         elif not isinstance(args, list):
             args = []
+
+        # Combine command args with explicit args
+        final_args = command_args + args
             
         env = config.get('env', {}) or config.get('environment', {})
         server_type = config.get('type', 'stdio')
         
         return MCPServer(
             name=name,
-            command=command,
-            args=args,
+            command=actual_command,
+            args=final_args,
             env=env,
             server_type=server_type
         )
@@ -504,26 +580,51 @@ class AARG:
                 # Load dependency config
                 assistant_configs = {
                     AssistantType.CLAUDE: [
+                        # User configs
                         self.home_dir / ".claude.json",
                         self.home_dir / ".claude" / "claude.json",
                         self.home_dir / ".config" / "claude" / "config.json",
+                        # Project configs
+                        self.current_dir / ".claude" / "settings.json",
+                        self.current_dir / ".claude" / "settings.local.json",
+                        # Enterprise/System configs
+                        Path("/etc/claude-code/managed-settings.json"),
+                        Path("/Library/Application Support/ClaudeCode/managed-settings.json")
                     ],
                     AssistantType.GEMINI: [
+                        # User configs
                         self.home_dir / ".gemini" / "settings.json",
-                        self.current_dir / ".gemini" / "settings.json",
                         self.home_dir / ".config" / "gemini" / "config.json",
+                        # Project configs
+                        self.current_dir / ".gemini" / "settings.json",
+                        self.current_dir / ".gemini" / "config.json"
                     ],
                     AssistantType.OPENCODE: [
-                        self.home_dir / ".opencode" / "config.json",
-                        self.home_dir / ".config" / "opencode" / "settings.json",
+                        # Custom config via environment variable
+                        Path(os.environ.get("OPENCODE_CONFIG", "")),
+                        # Project configs (highest precedence)
+                        self.current_dir / "opencode.json",
+                        # User configs
+                        self.home_dir / ".config" / "opencode" / "opencode.json",
+                        self.home_dir / ".opencode.json"
                     ],
                     AssistantType.WINDSURF: [
+                        # User configs
                         self.home_dir / ".windsurf" / "config.json",
                         self.home_dir / ".config" / "windsurf" / "settings.json",
+                        self.home_dir / ".codeium" / ".codeiumignore",
+                        # Project configs
+                        self.current_dir / ".windsurfrules",
+                        self.current_dir / ".windsurf" / "rules"
                     ],
                     AssistantType.CURSOR: [
+                        # User configs
                         self.home_dir / ".cursor" / "config.json",
+                        self.home_dir / ".cursor" / "cli-config.json",
+                        self.home_dir / ".cursor-server",
                         self.home_dir / ".config" / "cursor" / "settings.json",
+                        # Project configs
+                        self.current_dir / ".cursor" / "index.mdc"
                     ]
                 }
 
@@ -629,20 +730,8 @@ class AARG:
             str(self.home_dir / '.gem'),
             str(self.home_dir / '.go'),
 
-            # System directories
-            '/tmp',
-            '/var/tmp',
-            '/lib',
-            '/lib64',
-            '/usr/lib',
-            '/usr/lib64',
-            '/usr/share',
-            '/usr/local/lib',
-            '/usr/local/share',
-
-            # Development tools
+            # Development tools (minimal set)
             '/etc/ssl/certs',  # For HTTPS connections
-            '/etc/alternatives',  # For alternative commands
         ]
 
         # Add assistant-specific directories for ALL configs (including dependencies)
@@ -650,21 +739,25 @@ class AARG:
             AssistantType.CLAUDE: [
                 str(self.home_dir / '.claude'),
                 str(self.home_dir / '.config' / 'claude'),
+                '/etc/claude-code',
+                '/Library/Application Support/ClaudeCode'
             ],
             AssistantType.GEMINI: [
                 str(self.home_dir / '.gemini'),
                 str(self.home_dir / '.config' / 'gemini'),
             ],
             AssistantType.OPENCODE: [
-                str(self.home_dir / '.opencode'),
                 str(self.home_dir / '.config' / 'opencode'),
+                str(self.home_dir / '.opencode'),
             ],
             AssistantType.WINDSURF: [
                 str(self.home_dir / '.windsurf'),
                 str(self.home_dir / '.config' / 'windsurf'),
+                str(self.home_dir / '.codeium'),
             ],
             AssistantType.CURSOR: [
                 str(self.home_dir / '.cursor'),
+                str(self.home_dir / '.cursor-server'),
                 str(self.home_dir / '.config' / 'cursor'),
             ]
         }
@@ -744,7 +837,7 @@ class AARG:
                 "# Container tool access (Docker/Podman)",
                 "ignore noroot",  # Docker needs root in container
                 "whitelist /var/run/docker.sock",
-                "whitelist /run/user/${UID}/podman",
+                f"whitelist /run/user/{os.getuid()}/podman",
             ])
             
         profile_lines.extend([
@@ -767,8 +860,7 @@ class AARG:
             "# Additional hardening",
             "caps.drop all",
             "seccomp",
-            "private-dev",
-            "noexec /tmp",  # Prevent execution from tmp
+            "private-dev"
         ])
         
         return "\n".join(profile_lines)
@@ -786,14 +878,14 @@ class AARG:
             if len(assistant_names) > 1:
                 primary = assistant_names[0]
                 dependencies = assistant_names[1:]
-                profile_name = f"{primary}-with-{'-'.join(dependencies)}-{self.project_name}.agentenanstaltsregeln"
+                profile_name = f"{primary}-with-{'-'.join(dependencies)}-{self.project_name}.profile"
             else:
-                profile_name = f"{assistant_names[0]}-{self.project_name}.agentenanstaltsregeln"
+                profile_name = f"{assistant_names[0]}-{self.project_name}.profile"
         else:
             assistant_name = self.assistant_type.value
             if assistant_name == "auto":
                 assistant_name = "ai-assistant"
-            profile_name = f"{assistant_name}-{self.project_name}.agentenanstaltsregeln"
+            profile_name = f"{assistant_name}-{self.project_name}.profile"
 
         return firejail_dir / profile_name
         
@@ -1066,7 +1158,7 @@ class AARG:
         
         # Save optimized profile
         original_path = self.suggest_profile_path()
-        optimized_path = original_path.with_suffix('.optimized.agentenanstaltsregeln')
+        optimized_path = original_path.with_suffix('.optimized.profile')
         
         try:
             response = input(f"\n❓ Save optimized institutional rules to {optimized_path}? [y/N]: ").strip().lower()

@@ -253,7 +253,7 @@ AI assistants need access to these critical system areas:
 #### Assistant-Specific Directories
 - `~/.claude/` - Claude Code configurations
 - `~/.gemini/` - Gemini CLI settings
-- `~/.opencode/` - OpenCode configurations
+- `~/.config/opencode/` - OpenCode configurations
 - `~/.windsurf/` - Windsurf settings
 - `~/.cursor/` - Cursor configurations
 
@@ -371,6 +371,30 @@ AARG intelligently handles different configuration formats:
 }
 ```
 
+#### OpenCode Configuration
+```json
+{
+  "mcp": {
+    "filesystem": {
+      "type": "local",
+      "command": ["npx", "@modelcontextprotocol/server-filesystem"],
+      "enabled": true,
+      "environment": {
+        "ALLOWED_PATHS": "/path/to/project"
+      }
+    },
+    "web-search": {
+      "type": "remote",
+      "url": "https://api.example.com/mcp",
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
+
 ### Multi-Scope Configuration Handling
 
 AARG implements sophisticated configuration precedence:
@@ -379,7 +403,21 @@ AARG implements sophisticated configuration precedence:
 2. **User-level configs** provide defaults
 3. **System-level configs** (if any) provide fallbacks
 
-For Claude specifically, AARG handles the complex nested structure where both global and project-specific MCP servers can be defined in the same file.
+#### Assistant-Specific Configuration Discovery
+
+**Claude Code:**
+- Handles complex nested structure where both global and project-specific MCP servers can be defined in the same file
+- Supports project-specific overrides in the "projects" section
+
+**OpenCode:**
+- Configuration hierarchy: `OPENCODE_CONFIG` env var > project `opencode.json` > `~/.config/opencode/opencode.json`
+- Supports both JSON and JSONC (JSON with Comments) formats
+- Project configs are discovered by traversing up to the nearest Git directory
+- Uses "mcp" key instead of "mcpServers" for MCP server configuration
+
+**Gemini CLI:**
+- Simple global configuration in `~/.gemini/settings.json`
+- Project-specific configs supported in `.gemini/settings.json`
 
 ## Understanding the Generated Rules
 
@@ -599,6 +637,30 @@ No more ugly Python stack traces!
 }
 ```
 
+### OpenCode Format
+```json
+{
+  "mcp": {
+    "server-name": {
+      "type": "local",
+      "command": ["command-name", "arg1", "arg2"],
+      "enabled": true,
+      "environment": {
+        "ENV_VAR": "value"
+      }
+    },
+    "remote-server": {
+      "type": "remote",
+      "url": "https://example.com/mcp",
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer token"
+      }
+    }
+  }
+}
+```
+
 ### Generic Format
 ```json
 {
@@ -612,6 +674,111 @@ No more ugly Python stack traces!
 ```
 
 AARG understands them all!
+
+## Complete Configuration Reference
+
+AARG searches for AI assistant configurations in a hierarchical order, with project-specific settings taking precedence over user settings, and user settings taking precedence over system-wide settings.
+
+### Claude Code Configuration Locations
+
+AARG searches for Claude configurations in this order:
+
+**Enterprise/System Configurations (highest precedence for managed environments):**
+- `/etc/claude-code/managed-settings.json` (Linux enterprise deployments)
+- `/Library/Application Support/ClaudeCode/managed-settings.json` (macOS enterprise deployments)
+
+**Project-Specific Configurations:**
+- `.claude/settings.json` (project workspace settings)
+- `.claude/settings.local.json` (local project settings, typically gitignored)
+
+**User Configurations:**
+- `~/.claude.json` (primary user config)
+- `~/.claude/claude.json` (alternative location)
+- `~/.config/claude/config.json` (XDG Base Directory compliant)
+
+### Gemini CLI Configuration Locations
+
+**Project-Specific Configurations:**
+- `.gemini/settings.json` (project workspace settings)
+- `.gemini/config.json` (alternative project config)
+
+**User Configurations:**
+- `~/.gemini/settings.json` (primary user config)
+- `~/.config/gemini/config.json` (XDG Base Directory compliant)
+
+### OpenCode Configuration Locations
+
+OpenCode follows a unique hierarchy supporting environment variable overrides:
+
+**Custom Configuration Path (highest precedence):**
+- `$OPENCODE_CONFIG` (environment variable pointing to custom config file)
+
+**Project-Specific Configurations:**
+- `opencode.json` (in project root, highest precedence for project settings)
+
+**User Configurations:**
+- `~/.config/opencode/opencode.json` (XDG Base Directory compliant)
+- `~/.opencode.json` (legacy location for backward compatibility)
+
+### Windsurf IDE Configuration Locations
+
+**Project-Specific Configurations:**
+- `.windsurfrules` (project-specific AI rules)
+- `.windsurf/rules` (project rules directory)
+
+**User Configurations:**
+- `~/.windsurf/config.json` (primary user config)
+- `~/.config/windsurf/settings.json` (XDG Base Directory compliant)
+- `~/.codeium/.codeiumignore` (global ignore rules for enterprise deployments)
+
+### Cursor IDE Configuration Locations
+
+**Project-Specific Configurations:**
+- `.cursor/index.mdc` (project-specific cursor rules and settings)
+
+**User Configurations:**
+- `~/.cursor/config.json` (primary user config)
+- `~/.cursor/cli-config.json` (CLI-specific configuration)
+- `~/.cursor-server/` (remote server configuration directory)
+- `~/.config/cursor/settings.json` (XDG Base Directory compliant)
+
+### Configuration Hierarchy and Precedence
+
+AARG follows this precedence order (highest to lowest):
+
+1. **Environment Variables** (OpenCode: `$OPENCODE_CONFIG`)
+2. **Enterprise/System Managed Settings** (Claude enterprise deployments)
+3. **Project-Specific Settings** (`.claude/`, `opencode.json`, `.windsurf/`, `.cursor/`)
+4. **User XDG Config** (`~/.config/assistant-name/`)
+5. **User Home Config** (`~/.assistant-name/`)
+6. **Legacy Locations** (backward compatibility)
+
+### Directory Permissions in Institutional Rules
+
+AARG automatically includes all relevant configuration directories in the generated firejail profiles:
+
+```bash
+# Claude configuration access
+whitelist ~/.claude
+whitelist ~/.config/claude
+whitelist /etc/claude-code              # Enterprise deployments
+
+# OpenCode configuration access
+whitelist ~/.config/opencode
+whitelist ~/.opencode                   # Legacy support
+
+# Windsurf configuration access
+whitelist ~/.windsurf
+whitelist ~/.config/windsurf
+whitelist ~/.codeium                    # Enterprise ignore rules
+
+# Cursor configuration access
+whitelist ~/.cursor
+whitelist ~/.cursor-server
+whitelist ~/.config/cursor
+```
+
+This ensures your AI assistants can access their configurations while maintaining security boundaries.
 
 ## Advanced Scenarios
 
