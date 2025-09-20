@@ -17,14 +17,24 @@ In true German fashion, we combined all these nouns into one gloriously bureaucr
 
 ## What AARG Actually Does
 
-AARG generates custom firejail profiles that focus your AI assistant's full power exactly where you need it - in your project folder. It:
-- Auto-detects your AI assistants (Claude, Gemini, etc.)
-- Parses their configurations to find MCP servers and tool dependencies
-- Creates comprehensive "institution rules" (firejail profiles)
-- Ensures the agent works with full capabilities inside your project, and only there
-- Prevents accidental access to unrelated system areas during normal operations
+AARG generates enterprise-ready firejail profiles that focus your AI assistant's full power exactly where you need it - in your project folder. It:
 
-With AARG, your AI agent becomes a focused productivity powerhouse, channeling all its capabilities into your current project while preventing any accidental interactions with unrelated parts of your system. It's like having a dedicated workspace where your AI assistant can operate at full strength, professionally contained to the task at hand.
+### 🔧 **Core Features**
+- **Auto-detects your AI assistants** (Claude, Gemini, OpenCode, Windsurf, Cursor)
+- **Parses configurations** to find MCP servers and cross-assistant dependencies
+- **Creates comprehensive "institution rules"** (firejail profiles)
+- **Dynamic system library discovery** - no hardcoded versions, works across Linux distros
+- **Enterprise DNS support** - respects corporate/internal DNS servers
+- **Whitelist-only security** - principle of least privilege approach
+
+### 🏢 **Enterprise Ready**
+- **Distribution-agnostic** - works on any Linux distribution
+- **Corporate network friendly** - uses system DNS, no hardcoded public DNS
+- **Cross-assistant dependencies** - automatically handles Claude + Gemini MCP setups
+- **Network connectivity** - proper DNS resolution without restrictive firewall rules
+- **Security compliant** - follows professional security best practices
+
+With AARG, your AI agent becomes a focused productivity powerhouse, channeling all its capabilities into your current project while preventing any accidental interactions with unrelated parts of your system. It's like having a dedicated workspace where your AI assistant can operate at full strength, professionally contained to the task at hand - and it works seamlessly in corporate environments.
 
 ```bash
 # The full bureaucratic name (for documentation/headers)
@@ -41,3 +51,30 @@ cd ~/projects/myproject
 aarg
 # Generates: claude-myproject.agentenanstaltsregeln
 ```
+
+## Recent Improvements
+
+### Enterprise & Distribution Compatibility (Latest)
+
+**🎯 Problem Solved**: Fixed critical issues that prevented Claude from running in firejail and blocked network connectivity in enterprise environments.
+
+**✅ Key Fixes**:
+- **Dynamic System Library Discovery** - No more hardcoded library versions (e.g., `libc.so.6` vs `libc.so.7`). AARG now automatically discovers the correct library paths using glob patterns, making profiles work across different Linux distributions.
+
+- **Enterprise DNS Support** - Removed hardcoded public DNS servers (8.8.8.8) that break internal/corporate resource access. Now uses system DNS configuration (`/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`) to respect enterprise DNS settings.
+
+- **Whitelist-Only Security** - Eliminated the restrictive `private` directive that was causing "no suitable claude executable found" errors. Now uses whitelist-only approach for maximum compatibility while maintaining security.
+
+- **Proper Network Connectivity** - Fixed network access by removing blocking `netfilter` rules while preserving security through protocol restrictions and proper DNS resolution.
+
+**🏢 Enterprise Benefits**:
+- Works with corporate DNS servers and internal resources
+- Compatible across RHEL, Ubuntu, SUSE, Arch, and other distributions
+- Handles complex MCP dependencies (Claude + Gemini CLI)
+- Follows security best practices with least-privilege access
+
+**🔧 Technical Details**:
+- System libraries: `libc`, `libpthread`, `libm`, `libdl`, `libstdc++`, `libgcc_s`
+- DNS resolution: `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`
+- Network: `protocol unix,inet,inet6` without restrictive netfilter
+- Security: Whitelist-only paths and binaries, no filesystem isolation

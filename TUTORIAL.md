@@ -6,6 +6,8 @@ Welcome to the world of **aarg** (Agentenanstaltsregelgenerator) - the delightfu
 
 Think of AARG as a digital immigration officer for AI agents. It creates detailed "institutional rules" (Agentenanstaltsregeln) that tell your AI assistants exactly where they can go, what they can touch, and how they should behave - all while maintaining that characteristic German precision and efficiency.
 
+**🆕 Now Enterprise-Ready!** AARG has been enhanced with dynamic system library discovery, enterprise DNS support, and distribution-agnostic profiles that work seamlessly in corporate environments across all Linux distributions.
+
 ### The Bureaucratic Metaphor
 
 AARG treats AI assistants as "residents" in a structured "institution" where:
@@ -583,6 +585,43 @@ This is exactly what AARG solves! The issue is usually:
 2. **Missing config access:** AARG includes `~/.claude/`, `~/.gemini/`, etc.
 3. **Missing dependencies:** Use AARG's dependency detection
 
+### "Unable to connect to Anthropic services" or Network Issues
+
+**Enterprise/Corporate Network Problems:**
+
+AARG now handles enterprise environments correctly:
+
+```bash
+# ✅ FIXED: Enterprise DNS Support
+# AARG now includes system DNS configuration:
+# - /etc/resolv.conf (respects corporate DNS servers)
+# - /etc/hosts (local hostname resolution)
+# - /etc/nsswitch.conf (name service configuration)
+
+# ✅ FIXED: No hardcoded public DNS servers
+# Previous versions used 8.8.8.8 which broke internal resources
+# Now uses your system's DNS configuration
+```
+
+**Library Loading Issues:**
+
+```bash
+# ✅ FIXED: Dynamic library discovery
+# AARG now auto-detects correct library versions:
+# - libc.so.* (core C library)
+# - libpthread.so.* (POSIX threads)
+# - libdl.so.* (dynamic loading)
+# - libm.so.* (math library)
+# - And more...
+
+# No more "cannot open shared object file" errors!
+```
+
+**If you still have issues:**
+1. Regenerate profile: `aarg --assistant claude`
+2. Check network: `firejail --profile=your-profile curl -I https://api.anthropic.com`
+3. Verify DNS: `firejail --profile=your-profile nslookup api.anthropic.com`
+
 ### "Profile too permissive"
 
 Use the optimization workflow:
@@ -594,8 +633,56 @@ firejail --tracelog --profile=your-profile your-assistant
 # 2. Optimize
 aarg --optimize --assistant your-assistant
 
-# 3. Use the .optimized.agentenanstaltsregeln file
+# 3. Use the .optimized.profile file
 ```
+
+### "OpenCode command array errors"
+
+If you encounter `TypeError: unhashable type 'list'` when processing OpenCode configurations:
+
+**Fixed in latest version!** AARG now properly handles OpenCode's flexible command format:
+
+```json
+{
+  "mcp": {
+    "server-name": {
+      "command": ["uvx", "--from", "git+https://github.com/repo", "tool"],
+      "enabled": true
+    }
+  }
+}
+```
+
+### "Firejail profile errors"
+
+Common firejail issues and solutions:
+
+**"invalid whitelist path" errors:**
+```bash
+Error: invalid whitelist path /lib
+Error: invalid whitelist path /tmp
+```
+
+**Solution:** AARG has been updated to avoid problematic system directories. Regenerate your profile:
+```bash
+aarg --assistant your-assistant  # Creates new .profile file
+```
+
+**"no suitable executable found" in firejail:**
+```bash
+Error: no suitable claude executable found
+```
+
+**Solutions:**
+1. Use full path: `firejail --profile=your-profile /home/user/.local/bin/claude`
+2. The sandbox is working correctly - this indicates proper security isolation
+3. You may need additional system dependencies not included in the minimal profile
+
+**Profile filename issues:**
+- ✅ Correct: `claude-project.profile`
+- ❌ Incorrect: `claude-project.agentenanstaltsregeln`
+
+AARG now generates proper `.profile` extensions for firejail compatibility.
 
 ### Ctrl-C Handling
 

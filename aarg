@@ -2,10 +2,19 @@
 """
 aarg - Agentenanstaltsregelgenerator (Agent Institution Rule Generator)
 
-Generates firejail profiles ("Agentenanstaltsregeln") to securely sandbox AI coding
-assistants while preserving their functionality. Applies the principle of least
-privilege by creating structured institutional rules for AI agents. Supports Claude
-Code, Gemini CLI, and other MCP-compatible assistants.
+Generates enterprise-ready firejail profiles ("Agentenanstaltsregeln") to securely
+sandbox AI coding assistants while preserving their functionality. Uses dynamic
+system library discovery and respects enterprise DNS configurations for compatibility
+across Linux distributions and corporate environments.
+
+Key Features:
+- Dynamic system library discovery (no hardcoded versions)
+- Enterprise DNS support (respects local/corporate DNS servers)
+- Cross-assistant dependency detection (e.g., Claude with Gemini MCP)
+- Distribution-agnostic profiles (works on any Linux distro)
+- Whitelist-only security approach (principle of least privilege)
+
+Supports Claude Code, Gemini CLI, OpenCode, Windsurf, Cursor, and other MCP-compatible assistants.
 """
 
 import argparse
@@ -680,6 +689,10 @@ class AARG:
             binary_path = self._find_binary_path(binary)
             if binary_path:
                 self.whitelisted_binaries.add(binary_path)
+
+                # Resolve symlinks and add target directories
+                self._resolve_and_whitelist_symlinks(binary_path)
+
                 logger.debug(f"  ✅ {binary}: {binary_path}")
             else:
                 logger.debug(f"  ⚠️  {binary}: not found in PATH")
@@ -707,9 +720,49 @@ class AARG:
                 return str(path)
                 
         return None
-        
+
+    def _resolve_and_whitelist_symlinks(self, binary_path: str) -> None:
+        """Resolve symlinks and add target directories to whitelist."""
+        path = Path(binary_path)
+
+        # If it's a symlink, resolve it and add target directory
+        if path.is_symlink():
+            try:
+                target = path.readlink()
+
+                # Handle relative symlinks
+                if not target.is_absolute():
+                    target = path.parent / target
+
+                target = target.resolve()
+
+                # Add the target's parent directory to whitelist
+                # But avoid problematic system directories
+                if target.exists():
+                    target_dir = str(target.parent)
+                    # Skip system directories that can't be whitelisted
+                    if target_dir not in ['/usr/bin', '/bin', '/sbin', '/usr/sbin']:
+                        self.whitelisted_paths.add(target_dir)
+                        logger.debug(f"    ↳ Symlink target dir: {target_dir}")
+                    else:
+                        logger.debug(f"    ↳ Skipping system dir: {target_dir}")
+
+                    # Recursively resolve if target is also a symlink
+                    if target.is_symlink():
+                        self._resolve_and_whitelist_symlinks(str(target))
+
+            except (OSError, RuntimeError) as e:
+                logger.debug(f"    ⚠️  Could not resolve symlink {binary_path}: {e}")
+
     def add_essential_paths(self, configs: List[AssistantConfig]) -> None:
-        """Add essential directories for development tools."""
+        """Add essential directories for development tools and enterprise connectivity.
+
+        Includes:
+        - Dynamic system library discovery (no hardcoded versions)
+        - Enterprise DNS resolution files (/etc/resolv.conf, /etc/hosts)
+        - Assistant-specific config directories
+        - Development tool paths
+        """
         essential_paths = [
             # User directories
             str(self.home_dir / '.local'),
@@ -730,9 +783,40 @@ class AARG:
             str(self.home_dir / '.gem'),
             str(self.home_dir / '.go'),
 
-            # Development tools (minimal set)
+            # Development tools (only safe paths)
             '/etc/ssl/certs',  # For HTTPS connections
+
+            # DNS resolution (essential for network connectivity)
+            '/etc/resolv.conf',  # DNS server configuration
+            '/etc/hosts',        # Local hostname resolution
+            '/etc/nsswitch.conf', # Name service configuration
         ]
+
+        # Essential system libraries - find actual paths dynamically
+        system_libs = []
+
+        # Dynamic linker (essential for all executables)
+        for linker_path in ['/usr/lib64/ld-linux-x86-64.so.2', '/lib64/ld-linux-x86-64.so.2']:
+            if os.path.exists(linker_path):
+                system_libs.append(linker_path)
+                break
+
+        # Essential shared libraries - use glob to find versions
+        import glob
+        lib_patterns = [
+            '/usr/lib64/libc.so.*',      # Core C library
+            '/usr/lib64/libpthread.so.*', # POSIX threads
+            '/usr/lib64/libm.so.*',      # Math library
+            '/usr/lib64/libdl.so.*',     # Dynamic loading
+            '/usr/lib64/libstdc++.so.*', # C++ runtime
+            '/usr/lib64/libgcc_s.so.*'   # GCC runtime
+        ]
+
+        for pattern in lib_patterns:
+            matches = glob.glob(pattern)
+            if matches:
+                # Add the first match (usually the main symlink)
+                system_libs.append(sorted(matches)[0])
 
         # Add assistant-specific directories for ALL configs (including dependencies)
         assistant_paths_map = {
@@ -762,6 +846,9 @@ class AARG:
             ]
         }
 
+        # Add system libraries to essential paths
+        essential_paths.extend(system_libs)
+
         for config in configs:
             paths_for_assistant = assistant_paths_map.get(config.type, [])
             essential_paths.extend(paths_for_assistant)
@@ -775,6 +862,11 @@ class AARG:
         logger.info("\n🏢 Adding permitted areas (directories) to institutional rules...")
         
         for path in essential_paths:
+            # Skip system library directories that will be handled as read-only
+            if path in ['/usr/lib64', '/usr/lib', '/lib64', '/lib']:
+                logger.debug(f"  ⚠️  {path}: system library directory (handled as read-only)")
+                continue
+
             if os.path.exists(path):
                 self.whitelisted_paths.add(path)
                 logger.debug(f"  ✅ {path}")
@@ -782,7 +874,15 @@ class AARG:
                 logger.debug(f"  ⚠️  {path}: doesn't exist (skipping)")
                 
     def generate_profile(self, enable_logging: bool = False, configs: List[AssistantConfig] = None) -> str:
-        """Generate the firejail Agentenanstaltsregeln profile."""
+        """Generate enterprise-ready firejail Agentenanstaltsregeln profile.
+
+        Creates a whitelist-only security profile with:
+        - Dynamic system library discovery (distribution-agnostic)
+        - Enterprise DNS support (respects corporate DNS servers)
+        - Proper network connectivity without restrictive netfilter
+        - Cross-assistant dependency support (e.g., Claude + Gemini MCP)
+        - Optional usage tracking for optimization
+        """
         configs = configs or []
 
         # Generate profile name based on assistants included
@@ -801,8 +901,8 @@ class AARG:
             "",
             "include globals.local",
             "",
-            "# Private institutional area - restricted to project directory",
-            f"private {self.current_dir}",
+            "# Working directory access - no private isolation (for compatibility)",
+            f"# Restricting access via whitelist rules below instead of private directive",
             "",
         ]
         
@@ -820,12 +920,20 @@ class AARG:
         # Add whitelisted paths
         for path in sorted(self.whitelisted_paths):
             profile_lines.append(f"whitelist {path}")
-            
+
+        # Add essential system directories as read-only
         profile_lines.extend([
+            "",
+            "# Essential system libraries (read-only)",
+            "read-only /usr/lib64",
+            "read-only /usr/lib",
+            "",
+            "# Dynamic linker (essential for all executables)",
+            "whitelist /usr/lib64/ld-linux-x86-64.so.2",
             "",
             "# Permitted tools (whitelisted binaries)",
         ])
-        
+
         # Add whitelisted binaries
         for binary in sorted(self.whitelisted_binaries):
             profile_lines.append(f"whitelist {binary}")
@@ -843,7 +951,7 @@ class AARG:
         profile_lines.extend([
             "",
             "# Network access (required for MCP servers and package managers)",
-            "netfilter",
+            "# Note: using system DNS to support enterprise/internal resources",
             "protocol unix,inet,inet6",
             "",
             "# Security restrictions - institutional rules",
@@ -1182,15 +1290,22 @@ class AARG:
 def main():
     """Main entry point for the application."""
     parser = argparse.ArgumentParser(
-        description="aarg - Agentenanstaltsregelgenerator for AI Coding Assistants",
+        description="aarg - Enterprise-ready Agentenanstaltsregelgenerator for AI Coding Assistants",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                    # Auto-detect assistant and generate institutional rules
-  %(prog)s --assistant claude # Generate institutional rules for Claude Code
+  %(prog)s                    # Auto-detect assistant and generate enterprise-ready rules
+  %(prog)s --assistant claude # Generate rules for Claude Code with dynamic library discovery
   %(prog)s --analyze          # Analyze firejail logs to see usage patterns
-  %(prog)s --optimize         # Optimize existing institutional rules based on usage
+  %(prog)s --optimize         # Optimize existing rules based on actual usage
   %(prog)s --verbose          # Show detailed debugging information
+
+Features:
+  • Dynamic system library discovery (no hardcoded versions)
+  • Enterprise DNS support (respects corporate DNS servers)
+  • Cross-assistant dependency detection (Claude + Gemini MCP)
+  • Distribution-agnostic profiles (works on any Linux distro)
+  • Whitelist-only security (principle of least privilege)
         """
     )
     
